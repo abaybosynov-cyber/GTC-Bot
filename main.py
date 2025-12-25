@@ -1,108 +1,119 @@
 import os
-import asyncio
-import logging
+import json
+import time
+import urllib.parse
+import urllib.request
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
-from aiogram.enums import ChatType, ParseMode
-
-from openai import OpenAI
-
-# -----------------------------
-# Config
-# -----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not BOT_TOKEN:
-    raise RuntimeError("Missing BOT_TOKEN env var")
+    raise RuntimeError("Missing BOT_TOKEN")
 if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY env var")
+    raise RuntimeError("Missing OPENAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-ALLOWED_TOPICS = {1, 7}  # Дискуссия, Вопрос–Ответ
+ALLOWED_TOPICS = {1, 7}  # разрешённые темы
 
 SYSTEM_PROMPT = (
     "Ты FAQ-ассистент компании Global Trend. "
     "Отвечай кратко и по делу. "
-    "Не ставь диагнозы и не обещай гарантированный результат. "
+    "Не ставь диагнозы, не обещай гарантированный результат. "
     "Если вопрос медицинский — рекомендуй обратиться к специалисту."
 )
 
-# -----------------------------
-# Bot / Dispatcher
-# -----------------------------
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher()
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-logging.basicConfig(level=logging.INFO)
+def tg(method: str, payload: dict):
+    url = f"{TG_API}/{method}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
+def openai_chat(user_text: str) -> str:
+    url = "https://api.openai.com/v1/chat/completions"
+    payload = {
+        "model": "gpt-4o-mini",
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_text}
+        ]
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        out = json.loads(resp.read().decode("utf-8"))
+    return out["choices"][0]["message"]["content"].strip()
 
-def topic_id_of(message: Message):
-    # В темах Telegram forum это message_thread_id (int)
-    return message.message_thread_id
+def main():
+    offset = None
+    print("Bot started (no external libs).")
 
-
-# 1) ГЛОБАЛЬНЫЙ ФИЛЬТР: удаляет ВСЁ вне тем 1/7 (любой тип контента)
-@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
-async def enforce_topics(message: Message):
-    # Не трогаем сообщения самого бота
-    if message.from_user and message.from_user.is_bot:
-        return
-
-    tid = topic_id_of(message)
-
-    # Лог для контроля (посмотри в консоли/Railway logs)
-    logging.info(f"IN: chat={message.chat.id} tid={tid} msg={message.message_id} text={bool(message.text)}")
-
-    # Если не из разрешённой темы — удалить и остановиться
-    if tid not in ALLOWED_TOPICS:
+    while True:
         try:
-            await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+            params = {"timeout": 25}
+            if offset is not None:
+                params["offset"] = offset
+
+            # getUpdates with long polling
+            updates = tg("getUpdates", params)
+            if not updates.get("ok"):
+                time.sleep(2)
+                continue
+
+            for upd in updates.get("result", []):
+                offset = upd["update_id"] + 1
+
+                msg = upd.get("message")
+                if not msg:
+                    continue
+
+                chat = msg.get("chat", {})
+                chat_id = chat.get("id")
+                message_id = msg.get("message_id")
+                text = msg.get("text")
+                topic_id = msg.get("message_thread_id")  # форумная тема
+
+                # если не в разрешённой теме — удалить и не отвечать
+                if topic_id not in ALLOWED_TOPICS:
+                    try:
+                        tg("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+                    except Exception:
+                        pass
+                    continue
+
+                # отвечаем только на текст
+                if not text:
+                    continue
+
+                try:
+                    answer = openai_chat(text)
+                except Exception:
+                    answer = "Сервис временно недоступен. Попробуйте позже."
+
+                if len(answer) > 3500:
+                    answer = answer[:3500] + "…"
+
+                tg("sendMessage", {
+                    "chat_id": chat_id,
+                    "message_thread_id": topic_id,  # ответ именно в этой теме
+                    "reply_to_message_id": message_id,
+                    "text": answer
+                })
+
         except Exception as e:
-            logging.error(f"DELETE FAILED: chat={message.chat.id} msg={message.message_id} err={e}")
-        return
-
-    # Если тема разрешена — пропускаем дальше (не отвечаем тут)
-    # Важно: дальше будет отдельный handler на ответ AI
-
-
-# 2) ОТВЕТ AI: только текст и только в темах 1/7
-@dp.message(
-    F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}) &
-    F.text
-)
-async def ai_reply(message: Message):
-    tid = topic_id_of(message)
-    if tid not in ALLOWED_TOPICS:
-        return
-
-    try:
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": message.text},
-            ],
-        )
-        answer = completion.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"OPENAI FAILED: err={e}")
-        await message.reply("Сервис временно недоступен. Попробуйте позже.")
-        return
-
-    if len(answer) > 3500:
-        answer = answer[:3500] + "…"
-
-    await message.reply(answer)
-
-
-async def main():
-    await dp.start_polling(bot)
-
+            # чтобы бот не умирал из-за временных сетевых ошибок
+            print("Loop error:", e)
+            time.sleep(2)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
 
