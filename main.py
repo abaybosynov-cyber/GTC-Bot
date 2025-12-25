@@ -1,16 +1,12 @@
 import os
 import asyncio
 import logging
-from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
-from aiogram.enums import ParseMode
+from aiogram.enums import ChatType, ParseMode
 
-from dotenv import load_dotenv
 from openai import OpenAI
-
-load_dotenv()
 
 # -----------------------------
 # Config
@@ -30,8 +26,7 @@ ALLOWED_TOPICS = {1, 7}  # Дискуссия, Вопрос–Ответ
 SYSTEM_PROMPT = (
     "Ты FAQ-ассистент компании Global Trend. "
     "Отвечай кратко и по делу. "
-    "Не ставь диагнозы, не обещай гарантированный результат, "
-    "не давай медицинских назначений. "
+    "Не ставь диагнозы и не обещай гарантированный результат. "
     "Если вопрос медицинский — рекомендуй обратиться к специалисту."
 )
 
@@ -41,64 +36,73 @@ SYSTEM_PROMPT = (
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
+logging.basicConfig(level=logging.INFO)
 
-def get_topic_id(message: Message) -> Optional[int]:
-    """
-    For forum topics in Telegram groups, aiogram v3 exposes message_thread_id.
-    If message is not from a topic, it may be None.
-    """
+
+def topic_id_of(message: Message):
+    # В темах Telegram forum это message_thread_id (int)
     return message.message_thread_id
 
 
-async def ask_openai(user_text: str) -> str:
-    """
-    Calls OpenAI Chat Completions (OpenAI Python SDK v1+).
-    """
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text},
-        ],
-        temperature=0.2,
-    )
-    return completion.choices[0].message.content.strip()
-
-
-@dp.message(F.text)
-async def on_text(message: Message) -> None:
-    topic_id = get_topic_id(message)
-
-    # If you want to allow DMs too, handle message.chat.type == "private" separately.
-    # Here we focus on group topics restriction logic.
-    if topic_id is None or topic_id not in ALLOWED_TOPICS:
-        # Delete messages outside allowed topics
-        try:
-            await message.delete()
-        except Exception:
-            # no rights or message already deleted
-            pass
+# 1) ГЛОБАЛЬНЫЙ ФИЛЬТР: удаляет ВСЁ вне тем 1/7 (любой тип контента)
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def enforce_topics(message: Message):
+    # Не трогаем сообщения самого бота
+    if message.from_user and message.from_user.is_bot:
         return
 
-    # Allowed topics: answer with AI
+    tid = topic_id_of(message)
+
+    # Лог для контроля (посмотри в консоли/Railway logs)
+    logging.info(f"IN: chat={message.chat.id} tid={tid} msg={message.message_id} text={bool(message.text)}")
+
+    # Если не из разрешённой темы — удалить и остановиться
+    if tid not in ALLOWED_TOPICS:
+        try:
+            await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+        except Exception as e:
+            logging.error(f"DELETE FAILED: chat={message.chat.id} msg={message.message_id} err={e}")
+        return
+
+    # Если тема разрешена — пропускаем дальше (не отвечаем тут)
+    # Важно: дальше будет отдельный handler на ответ AI
+
+
+# 2) ОТВЕТ AI: только текст и только в темах 1/7
+@dp.message(
+    F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}) &
+    F.text
+)
+async def ai_reply(message: Message):
+    tid = topic_id_of(message)
+    if tid not in ALLOWED_TOPICS:
+        return
+
     try:
-        answer = await ask_openai(message.text)
-    except Exception:
-        # Safe fallback if OpenAI call fails
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": message.text},
+            ],
+        )
+        answer = completion.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"OPENAI FAILED: err={e}")
         await message.reply("Сервис временно недоступен. Попробуйте позже.")
         return
 
-    # Prevent super-long messages
     if len(answer) > 3500:
         answer = answer[:3500] + "…"
 
     await message.reply(answer)
 
 
-async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+async def main():
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
